@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.idea/
+
+.env
+secrets.toml
+*.db
+
+maintenance/backups/*
+!maintenance/backups/.gitkeep
+maintenance/state/*
+!maintenance/state/.gitkeep
+maintenance/logs/*
+!maintenance/logs/.gitkeep
+
+feladatsor.pdf
+"Beadandó feladatsor.pdf"
