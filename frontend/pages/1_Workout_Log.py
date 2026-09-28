@@ -14,10 +14,16 @@ from datetime import date
 import httpx
 import streamlit as st
 
-from api_client import create_exercise, create_session, list_exercises, list_sessions
+from api_client import create_exercise, create_session, error_message, list_exercises, list_sessions
 
 st.set_page_config(page_title="Edzésnapló", page_icon="🏋️")
 st.title("🏋️ Edzésnapló")
+
+# A sikeres mentés után az oldal újrafut (st.rerun), ami az aznapi
+# üzenetet eltüntetné — ezért a session_state-ben visszük át a következő
+# futásra, és ott jelenítjük meg egyszer.
+if flash := st.session_state.pop("flash", None):
+    st.success(flash)
 
 # ---- Add a new exercise (small helper form) --------------------------------
 
@@ -29,19 +35,14 @@ with st.expander("Új gyakorlat felvétele"):
             try:
                 # POST /exercises hívása az api_client-en keresztül.
                 create_exercise(ex_name, ex_category)
-                st.success(f"'{ex_name}' gyakorlat létrehozva.")
+                st.session_state.flash = f"'{ex_name}' gyakorlat létrehozva."
                 # st.rerun(): újrafuttatja a teljes oldalt, hogy a
                 # frissen létrehozott gyakorlat megjelenjen a lenti
                 # legördülő listákban is.
                 st.rerun()
-            except httpx.HTTPStatusError as exc:
-                # A backend a hiba részleteit {"detail": "..."} JSON-ban
-                # adja vissza (lásd HTTPException a routerekben) — ezt
-                # jelenítjük meg közvetlenül a felhasználónak.
-                st.error(exc.response.json().get("detail", "Hiba történt."))
             except httpx.HTTPError as exc:
-                # Hálózati hiba / időtúllépés / backend el sem érhető.
-                st.error(f"Nem sikerült létrehozni a gyakorlatot: {exc}")
+                # A backend hibaüzenete (pl. 409: már létezik), vagy hálózati hiba.
+                st.error(f"Nem sikerült létrehozni a gyakorlatot: {error_message(exc)}")
 
 # ---- Add a new session ------------------------------------------------------
 
@@ -50,7 +51,7 @@ st.subheader("Új edzés rögzítése")
 try:
     exercises = list_exercises()
 except httpx.HTTPError as exc:
-    st.error(f"Nem sikerült lekérni a gyakorlatokat: {exc}")
+    st.error(f"Nem sikerült lekérni a gyakorlatokat: {error_message(exc)}")
     exercises = []
 
 if not exercises:
@@ -75,7 +76,9 @@ else:
         cols = st.columns(4)
         chosen = cols[0].selectbox("Gyakorlat", list(exercise_options.keys()), key=f"ex_{i}")
         weight = cols[1].number_input("Súly (kg)", min_value=0.0, step=2.5, key=f"w_{i}")
-        reps = cols[2].number_input("Ismétlés", min_value=1, step=1, key=f"r_{i}")
+        reps = cols[2].number_input(
+            "Ismétlés", min_value=1, step=1, key=f"r_{i}", help="12 ismétlés fölött a szett nem számít bele a progresszióba."
+        )
         set_payloads.append(
             {
                 "exercise_id": exercise_options[chosen],
@@ -102,17 +105,16 @@ else:
                 # -> workout_service.create_workout_session_with_sets ->
                 # adatbázis-írás -> a válasz a mentett session-t adja vissza.
                 create_session(session_date, notes or None, valid_sets)
-                st.success("Edzés elmentve.")
+                st.session_state.flash = "Edzés elmentve."
                 st.session_state.set_rows = 1
                 st.rerun()
-            except httpx.HTTPStatusError as exc:
-                st.error(exc.response.json().get("detail", "Hiba történt a mentés során."))
             except httpx.HTTPError as exc:
-                st.error(f"Nem sikerült elmenteni az edzést: {exc}")
+                st.error(f"Nem sikerült elmenteni az edzést: {error_message(exc)}")
 
 # ---- Filter & list existing sessions ---------------------------------------
 
 st.subheader("Korábbi edzések szűrése")
+exercise_names = {e["id"]: e["name"] for e in exercises}
 col_start, col_end = st.columns(2)
 start = col_start.date_input("Kezdő dátum", value=None, key="filter_start")
 end = col_end.date_input("Záró dátum", value=None, key="filter_end")
@@ -129,7 +131,14 @@ try:
                 if s["notes"]:
                     st.write(s["notes"])
                 st.table(
-                    [{"Gyakorlat ID": row["exercise_id"], "Súly": row["weight_kg"], "Ismétlés": row["reps"]} for row in s["sets"]]
+                    [
+                        {
+                            "Gyakorlat": exercise_names.get(row["exercise_id"], f"#{row['exercise_id']}"),
+                            "Súly (kg)": row["weight_kg"],
+                            "Ismétlés": row["reps"],
+                        }
+                        for row in s["sets"]
+                    ]
                 )
 except httpx.HTTPError as exc:
-    st.error(f"Nem sikerült lekérni az edzéseket: {exc}")
+    st.error(f"Nem sikerült lekérni az edzéseket: {error_message(exc)}")

@@ -1,56 +1,95 @@
 """Async calls to the backend's own API, used only by the maintenance program.
 
-Ez a fájl köti össze a maintenance vezérlőprogramot a saját FastAPI
-backendünkkel (nem a Renderrel!) — a backend/routers/internal.py
-tokennel védett végpontjait hívja meg, hogy zárolja/feloldja az
-írásokat, és ellenőrizze a cserét.
+A BackendAdmin a saját FastAPI backendünket hívja (nem a Rendert): a
+tokennel védett belső végpontokon zárolja/feloldja az írásokat és
+próba-írást végez, a nyilvános olvasó végpontokon pedig tartalmi
+pillanatképet készít. Az ingyenes Render backend elalhat, és a
+felébredése ~1 perc, ezért a hívások korlátozottan újrapróbálkoznak.
 """
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable, Callable
+from typing import TypeVar
+
 import httpx
 
-from maintenance.config import BACKEND_URL, MAINTENANCE_TOKEN
+from maintenance.retry import Sleep, with_retries
+from maintenance.snapshot import Snapshot, fetch_snapshot
+
+T = TypeVar("T")
 
 
-async def set_maintenance_mode(client: httpx.AsyncClient, enabled: bool) -> bool:
-    """A csere 2. lépése: POST /internal/maintenance-mode meghívása,
-    hogy zárolja (enabled=True) vagy feloldja (enabled=False) az
-    írásokat a backend/maintenance_mode.py-ban. A visszakapott
-    `writes_frozen` mezővel a hívó (db_swap_controller) meg tudja
-    erősíteni, hogy a zárolás ténylegesen érvénybe lépett."""
-    resp = await client.post(
-        f"{BACKEND_URL}/internal/maintenance-mode",
-        json={"enabled": enabled},
-        headers={"X-Maintenance-Token": MAINTENANCE_TOKEN},
-    )
-    resp.raise_for_status()
-    return resp.json()["writes_frozen"]
+class BackendAdmin:
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        *,
+        timeout_seconds: float = 60.0,
+        attempts: int = 5,
+        base_delay_seconds: float = 5.0,
+        transport: httpx.AsyncBaseTransport | None = None,
+        sleep: Sleep = asyncio.sleep,
+    ):
+        self._client = httpx.AsyncClient(
+            base_url=base_url,
+            headers={"X-Maintenance-Token": token},
+            timeout=timeout_seconds,
+            transport=transport,
+        )
+        self._attempts = attempts
+        self._base_delay = base_delay_seconds
+        self._sleep = sleep
 
+    async def __aenter__(self) -> BackendAdmin:
+        return self
 
-async def verify_restored_content(client: httpx.AsyncClient) -> bool:
-    """A plain healthy-status check is not enough; confirm a real read endpoint responds.
+    async def __aexit__(self, *_exc: object) -> None:
+        await self._client.aclose()
 
-    A csere 5. lépésének ellenőrzése: nem elég, ha a /health "ok"-ot
-    mond — ténylegesen le kell tudni kérdezni valós adatot (itt a
-    GET /exercises-t) az ÚJ, restore-olt adatbázisból, ami bizonyítja,
-    hogy a visszaállított tartalom valóban elérhető a backendről."""
-    resp = await client.get(f"{BACKEND_URL}/exercises")
-    resp.raise_for_status()
-    return isinstance(resp.json(), list)
+    async def _retrying(self, description: str, operation: Callable[[], Awaitable[T]]) -> T:
+        # Csak hálózati hibát és 5xx-et próbálunk újra; 4xx (pl. rossz
+        # token) azonnal továbbmegy a hívóhoz.
+        async def attempt() -> T:
+            try:
+                return await operation()
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code >= 500:
+                    raise httpx.TransportError(str(exc)) from exc
+                raise
 
+        return await with_retries(
+            attempt,
+            retry_on=(httpx.TransportError,),
+            attempts=self._attempts,
+            base_delay_seconds=self._base_delay,
+            description=f"backend {description}",
+            sleep=self._sleep,
+        )
 
-async def verify_writable(client: httpx.AsyncClient) -> bool:
-    """One controlled test write via the token-authorized internal check,
-    performed while normal application writes stay blocked.
+    async def set_writes_frozen(self, frozen: bool) -> bool:
+        """POST /internal/maintenance-mode; a backend által visszaigazolt állapotot adja."""
 
-    Meghívja a backend/routers/internal.py::write_check belső
-    végpontját, ami egy próba-sort ír be, majd rögtön törli — ezzel
-    igazolva, hogy az új adatbázis írható, miközben a normál
-    felhasználói írások továbbra is zárolva vannak."""
-    resp = await client.post(
-        f"{BACKEND_URL}/internal/write-check",
-        headers={"X-Maintenance-Token": MAINTENANCE_TOKEN},
-    )
-    resp.raise_for_status()
-    return resp.json()["writable"]
+        async def call() -> bool:
+            resp = await self._client.post("/internal/maintenance-mode", json={"enabled": frozen})
+            resp.raise_for_status()
+            return resp.json()["writes_frozen"]
+
+        return await self._retrying("set maintenance mode", call)
+
+    async def fetch_snapshot(self) -> Snapshot:
+        """A teljes tartalmi pillanatkép a nyilvános olvasó végpontokon át."""
+        return await self._retrying("snapshot", lambda: fetch_snapshot(self._client))
+
+    async def verify_writable(self) -> bool:
+        """Egy kontrollált próba-írás a tokenes belső végponton, miközben a
+        normál alkalmazás-írások zárolva maradnak."""
+
+        async def call() -> bool:
+            resp = await self._client.post("/internal/write-check")
+            resp.raise_for_status()
+            return resp.json()["writable"]
+
+        return await self._retrying("write check", call)

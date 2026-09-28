@@ -12,7 +12,7 @@ from __future__ import annotations
 import httpx
 import streamlit as st
 
-from api_client import list_sessions
+from api_client import error_message, list_sessions
 
 st.set_page_config(page_title="Edzésnapló", page_icon="🏋️", layout="wide")
 
@@ -36,4 +36,4 @@ try:
 except httpx.HTTPError as exc:
     # Ha a backend nem elérhető vagy hibát ad vissza, ne omoljon
     # össze az oldal — jelenjen meg egy érthető hibaüzenet helyette.
-    st.error(f"Nem sikerült lekérni az edzéseket: {exc}")
+    st.error(f"Nem sikerült lekérni az edzéseket: {error_message(exc)}")

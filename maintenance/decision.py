@@ -5,83 +5,84 @@ plain fixed inputs, per the assignment's requirement to test maintenance
 decisions without depending on any live service.
 
 Ez a fájl a maintenance modul funkcionális paradigma-helye: a
-decide_swap függvény tisztán a bemeneti adatokból dönt, nem éri el sem
-a hálózatot, sem a lemezt — ezért lehet fix, kézzel megírt teszt-
-esetekkel (transient hiba, hiányzó backup, megszakadt futás) ellenőrizni.
+függvények tisztán a bemeneti adatokból döntenek, nem érik el sem a
+hálózatot, sem a lemezt, sem az órát (a "most" is paraméter).
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from maintenance.models import CheckResult, RunState, SwapDecision
 
 DEFAULT_EXPIRY_WARNING_DAYS = 3
 
 
+def parse_maintenance_at(raw: str, tz: ZoneInfo) -> datetime | None:
+    """Parse the configured maintenance time into an aware UTC datetime.
+
+    Időzóna nélküli értéket (pl. "2026-10-01T02:00") a konfigurált
+    `tz` szerint értelmez, így az összehasonlítás mindig egyetlen,
+    konzisztens időzónában (UTC) történik. Üres szövegre None.
+    """
+    raw = raw.strip()
+    if not raw:
+        return None
+    parsed = datetime.fromisoformat(raw)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=tz)
+    return parsed.astimezone(timezone.utc)
+
+
+def _due_triggers(
+    check: CheckResult,
+    now: datetime,
+    maintenance_at: datetime | None,
+    expiry_warning_days: int,
+) -> list[tuple[str, str]]:
+    """Az éppen esedékes karbantartási kérések (trigger_key, ok) párjai."""
+    due: list[tuple[str, str]] = []
+    if maintenance_at is not None and now >= maintenance_at:
+        due.append((f"maintenance_at:{maintenance_at.isoformat()}", "configured maintenance time reached"))
+    if check.expires_at is not None and check.expires_at - now <= timedelta(days=expiry_warning_days):
+        due.append((f"expiry:{check.expires_at.isoformat()}", "instance approaching expiry"))
+    return due
+
+
 def decide_swap(
     check: CheckResult,
-    run_state: RunState | None,
+    last_run: RunState | None,
     now: datetime,
     maintenance_at: datetime | None = None,
     expiry_warning_days: int = DEFAULT_EXPIRY_WARNING_DAYS,
 ) -> SwapDecision:
     """Decide whether the current check result warrants starting a swap.
 
-    A mere connectivity failure or missing expiry data never triggers a
-    swap on its own. An already-fulfilled maintenance request (the run
-    that handled the same expiry timestamp already completed) must not
-    re-trigger.
-
-    Bemenetek: a legutóbbi állapotellenőrzés eredménye (`check` —
-    a maintenance/provider_client.py aszinkron hívásából), az előző
-    futás állapota (`run_state` — a maintenance/state.py::StateStore-ból
-    betöltve, vagy None, ha még soha nem futott), a jelenlegi idő, és
-    opcionálisan egy konfigurált karbantartási időpont
-    (`maintenance_at` — teszteléshez/próbafuttatáshoz, a valós lejárat
-    kivárása helyett). Kimenet: egy SwapDecision (kell-e cserélni + miért).
-    Ezt hívja a maintenance/db_swap_controller.py minden egyes
-    ütemezett ellenőrzés után, mielőtt bármilyen tényleges csere-lépést
-    elindítana.
+    Szabályok, sorrendben:
+    1. Puszta elérhetetlenség (hálózati hiba, hiányzó adat) SOSEM
+       indokol cserét — ez átmeneti gond is lehet.
+    2. Csak tervezett karbantartás (MAINTENANCE_AT elérve) vagy közelgő
+       lejárat (expires_at a figyelmeztetési ablakon belül) indít cserét.
+    3. Egy már teljesített kérés (a legutóbbi sikeres futás
+       `fulfilled_trigger`-e) nem indít újabb cserét — különben egy
+       próbafuttatás MAINTENANCE_AT-ja minden ciklusban újra cserélne.
     """
-    # 1. szabály: puszta elérhetetlenség (hálózati/kapcsolati hiba)
-    # SOSEM indokolja önmagában a cserét — ez csak átmeneti gond is
-    # lehet, nem feltétlenül azt jelenti, hogy le fog járni az instance.
     if not check.reachable:
         return SwapDecision(
             should_swap=False,
             reason="source unreachable: a connectivity failure alone does not warrant a swap",
         )
 
-    # 2. szabály: ha egy korábbi futás már sikeresen lekezelte pontosan
-    # ugyanezt a lejárati időpontot, ne indítsunk újra cserét csak azért,
-    # mert az ellenőrzés megint ugyanazt az expires_at-ot látja.
-    if run_state is not None and run_state.phase in ("completed",) and check.expires_at is not None:
-        if run_state.fulfilled_expiry_at == check.expires_at.isoformat():
-            return SwapDecision(
-                should_swap=False,
-                reason="maintenance for this expiry timestamp was already fulfilled",
-            )
+    due = _due_triggers(check, now, maintenance_at, expiry_warning_days)
+    if not due:
+        if check.expires_at is None and maintenance_at is None:
+            return SwapDecision(should_swap=False, reason="no expiry data and no maintenance time configured")
+        return SwapDecision(should_swap=False, reason="no maintenance due yet")
 
-    # 3. szabály: ha be van állítva egy konkrét (pl. próbafuttatáshoz
-    # konfigurált) karbantartási időpont, az felülírja a lejárat-alapú
-    # döntést — ez teszi lehetővé, hogy ne kelljen kivárni a valós
-    # 30 napos Render-lejáratot a rehearsalhoz.
-    if maintenance_at is not None:
-        if now >= maintenance_at:
-            return SwapDecision(should_swap=True, reason="configured maintenance time reached")
-        return SwapDecision(
-            should_swap=False, reason="configured maintenance time not yet reached"
-        )
+    fulfilled = last_run.fulfilled_trigger if last_run is not None else None
+    for trigger_key, reason in due:
+        if trigger_key != fulfilled:
+            return SwapDecision(should_swap=True, reason=reason, trigger_key=trigger_key)
 
-    # 4. szabály: ha nincs lejárati adat, nem tudunk dönteni — ez sem
-    # indokolja önmagában a cserét (üres/hiányzó adat != veszély).
-    if check.expires_at is None:
-        return SwapDecision(should_swap=False, reason="no expiry data available")
-
-    # 5. szabály: a tényleges trigger — ha a lejárat a beállított
-    # figyelmeztetési ablakon (expiry_warning_days) belülre esik.
-    if check.expires_at - now <= timedelta(days=expiry_warning_days):
-        return SwapDecision(should_swap=True, reason="instance approaching expiry")
-
-    return SwapDecision(should_swap=False, reason="not yet approaching expiry")
+    return SwapDecision(should_swap=False, reason="maintenance request already fulfilled")

@@ -1,217 +1,267 @@
-"""Stateful controller executing the five swap steps from the assignment spec.
+"""Stateful controller executing the swap steps from the assignment spec (Section 6.3).
 
-OOP paradigm: DBSwapController owns run_id/phase state and one method per
-swap step, with real behavior coordinating the provider client, backup
-functions, and the backend's internal endpoints.
+OOP paradigm: DBSwapController owns its collaborators (Render client,
+backend admin, state store, backup operations) and exposes one method per
+swap step, each of which persists the run state before returning.
 
-Ez a fájl valósítja meg a Section 6.3-ban leírt 5 lépéses csere-
-folyamatot. Minden metódus egy-egy lépésnek felel meg, és mindegyik a
-kapott RunState-et frissíti + lemezre menti (StateStore-on keresztül),
-mielőtt a következő lépésre lépne — így ha bármelyik lépés közben
-megszakadna a program, a maintenance/workflow.py::run_maintenance_cycle
-tudja, honnan kell folytatni (lásd `reconcile`).
+Minden lépés úgy készült, hogy megszakadás után biztonságosan
+megismételhető legyen (a törlés 404-et elfogad, a létrehozás előbb név
+szerint keres, a visszaállítás --clean módban fut), így a workflow
+mindig az utoljára befejezett lépés UTÁNI lépéstől folytathatja.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import uuid
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
 import httpx
 
-from maintenance.backend_admin import set_maintenance_mode, verify_restored_content, verify_writable
-from maintenance.backup import BackupMetadata, backup_database, ensure_backup_available, restore_database
-from maintenance.config import RENDER_OWNER_ID, RENDER_WEB_SERVICE_ID
+from maintenance.backend_admin import BackendAdmin
+from maintenance.backup import BackupMetadata, backup_database, load_backup, missing_pg_tools, restore_database
+from maintenance.config import MaintenanceSettings
 from maintenance.models import RunState
-from maintenance.provider_client import RenderClient
+from maintenance.provider_client import AmbiguousRenderError, RenderApiError, RenderClient, RenderNotFoundError
+from maintenance.rehearsal import rehearse_restore
+from maintenance.retry import Sleep
+from maintenance.snapshot import compare_snapshots
 from maintenance.state import StateStore
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_PLAN = "free"
-DEFAULT_REGION = "frankfurt"
-DEFAULT_PG_VERSION = "16"
+Step = Callable[[RunState], Awaitable[RunState]]
 
 
 class SwapHaltedError(RuntimeError):
-    """Raised when the controller cannot safely continue and halts the run.
+    """The controller cannot safely continue; a human must follow up."""
 
-    Ezt kapja el a maintenance/workflow.py, és állítja a futásállapotot
-    "halted"-ra — SOSEM próbál automatikusan helyrehozni egy ilyen
-    hibát, mert az kockázatosabb lenne, mint egy dokumentált, kézi
-    beavatkozást váró leállás."""
+
+@dataclass(frozen=True)
+class SwapOps:
+    """A külső eszközöket (pg_dump/pg_restore) hívó műveletek — a tesztek
+    ezeket cserélik le hamis változatokra, a vezérlési logikát nem."""
+
+    backup: Callable[[str, str, dict[str, Any], Path], BackupMetadata] = backup_database
+    load_backup: Callable[[str | None], BackupMetadata] = load_backup
+    restore: Callable[[BackupMetadata, str], None] = restore_database
+    rehearse: Callable[[BackupMetadata, str], Awaitable[None]] = rehearse_restore
+    missing_tools: Callable[[], list[str]] = missing_pg_tools
 
 
 class DBSwapController:
     def __init__(
         self,
         provider: RenderClient,
+        admin: BackendAdmin,
         state_store: StateStore,
-        http_client: httpx.AsyncClient,
-        source_dsn: str,
-        source_id: str,
+        settings: MaintenanceSettings,
+        ops: SwapOps | None = None,
+        sleep: Sleep = asyncio.sleep,
     ):
-        # provider: a Render API async klienshez (maintenance/provider_client.py).
-        # state_store: a futásállapot lemezre mentéséhez (maintenance/state.py).
-        # http_client: a SAJÁT backendünk belső végpontjainak hívásához
-        # (maintenance/backend_admin.py) — ez más, mint a `provider` HTTP klientje.
         self._provider = provider
+        self._admin = admin
         self._state = state_store
-        self._http = http_client
-        self._source_dsn = source_dsn
-        self._source_id = source_id
+        self._settings = settings
+        self._ops = ops or SwapOps()
+        self._sleep = sleep
 
-    def _new_run_state(self) -> RunState:
-        """Egy vadonatúj csere-futás azonosítóját (UUID) és kezdő
-        állapotát hozza létre."""
-        now = datetime.now(timezone.utc)
-        return RunState(run_id=str(uuid.uuid4()), phase="idle", started_at=now, updated_at=now)
+    # ---- run-state bookkeeping ---------------------------------------------------
 
-    def _save(self, run_state: RunState, phase: str, **updates: object) -> RunState:
-        """Közös segédfüggvény minden lépés végén: beállítja az új
-        fázist, frissíti az időbélyeget, alkalmazza az esetleges extra
-        mezőváltozásokat (pl. backup_id=...), a lépést hozzáfűzi a
-        futás naplójához (`run_state.log`), majd MINDIG lemezre menti
-        (self._state.save) — ez biztosítja, hogy soha ne vesszen el
-        egy lépés eredménye, ha a program a következő lépés közben áll le.
-        """
+    def _advance(self, run_state: RunState, phase: str, **updates: object) -> RunState:
+        """Egy lépés sikeres befejezésének tartós rögzítése (és naplózása)."""
         run_state.phase = phase  # type: ignore[assignment]
         run_state.updated_at = datetime.now(timezone.utc)
         for key, value in updates.items():
             setattr(run_state, key, value)
-        run_state.log.append(f"{run_state.updated_at.isoformat()}: {phase}")
+        run_state.log.append(f"{run_state.updated_at.isoformat()} {phase}")
         self._state.save(run_state)
+        logger.info("Swap run %s: step '%s' done", run_state.run_id, phase)
         return run_state
 
-    # ---- Step 1: prerequisites --------------------------------------------------
+    def halt(self, run_state: RunState, reason: str) -> RunState:
+        """Biztonságos leállás: a befejezett lépés (`halted_from`) megmarad,
+        így kézi ellenőrzés után a futás onnan folytatható."""
+        logger.error("Swap run %s halted after '%s': %s", run_state.run_id, run_state.phase, reason)
+        return self._advance(run_state, "halted", halted_from=run_state.phase, error=reason)
 
-    def check_prerequisites(self, run_state: RunState) -> RunState:
-        """1. lépés (Section 6.3/1): mielőtt bármit is csinálnánk,
-        ellenőrzi, hogy minden szükséges konfiguráció (Render tulajdonos
-        és service azonosító) megvan-e. Ha hiányzik valami, azonnal
-        SwapHaltedError-t dob — nem indul el félkész beállításokkal."""
-        missing = [
-            name
-            for name, value in [("RENDER_OWNER_ID", RENDER_OWNER_ID), ("RENDER_WEB_SERVICE_ID", RENDER_WEB_SERVICE_ID)]
-            if not value
+    def steps(self) -> list[tuple[str, Step]]:
+        """A lépések sorrendben, mindegyik azzal a fázissal, amit befejezve rögzít."""
+        return [
+            ("prerequisites_ok", self.check_prerequisites),
+            ("writes_frozen", self.freeze_writes),
+            ("backed_up", self.backup_source),
+            ("rehearsal_verified", self.rehearse_restore),
+            ("old_instance_deleted", self.delete_old_instance),
+            ("target_provisioned", self.provision_target),
+            ("restored", self.restore_target),
+            ("repointed", self.repoint_backend),
+            ("verified", self.verify_cutover),
+            ("completed", self.release_writes),
         ]
+
+    # ---- 1. prerequisites ------------------------------------------------------------
+
+    async def check_prerequisites(self, run_state: RunState) -> RunState:
+        """Konfiguráció, eszközök, mentési hely, jogosultság és erőforrás-azonosítók."""
+        s = self._settings
+        required = {
+            "RENDER_API_KEY": s.render_api_key,
+            "RENDER_OWNER_ID": s.render_owner_id,
+            "RENDER_WEB_SERVICE_ID": s.render_web_service_id,
+            "REHEARSAL_DATABASE_URL": s.rehearsal_database_url,
+            "ACTIVE_DB_INSTANCE_ID": run_state.active_instance_id,
+        }
+        missing = [name for name, value in required.items() if not value]
         if missing:
-            raise SwapHaltedError(f"Missing required configuration: {', '.join(missing)}")
+            raise SwapHaltedError(f"Missing configuration: {', '.join(missing)}")
+        if tools := self._ops.missing_tools():
+            raise SwapHaltedError(f"Backup tools not found on PATH: {', '.join(tools)}")
+        s.backup_dir.mkdir(parents=True, exist_ok=True)
+        probe = s.backup_dir / ".write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+
+        # Ezek a hívások a jogosultságot is igazolják (401/403 -> leállás).
+        await self._provider.get_service(s.render_web_service_id)
+        instance = await self._provider.get_postgres(run_state.active_instance_id or "")
+        owner_id = (instance.get("owner") or {}).get("id")
+        if owner_id != s.render_owner_id:
+            raise SwapHaltedError(
+                f"Instance {run_state.active_instance_id} is not owned by the configured workspace; refusing to manage it"
+            )
         logger.info(
-            "Prerequisites OK; targeting plan=%s region=%s version=%s", DEFAULT_PLAN, DEFAULT_REGION, DEFAULT_PG_VERSION
+            "Prerequisites OK; new instance will use plan=%s region=%s version=%s",
+            s.target_plan,
+            s.target_region,
+            s.target_pg_version,
         )
-        return self._save(run_state, "checking")
+        return self._advance(run_state, "prerequisites_ok")
 
-    # ---- Step 2: freeze writes + final backup -----------------------------------
+    # ---- 2. stop writes, then final backup ------------------------------------------------
 
-    async def freeze_writes_and_backup(self, run_state: RunState) -> RunState:
-        """2. lépés: ELŐSZÖR zárolja az írásokat a saját backendünkön
-        (maintenance/backend_admin.py::set_maintenance_mode ->
-        backend/routers/internal.py -> backend/maintenance_mode.py),
-        és CSAK EZUTÁN készíti el a végleges biztonsági mentést
-        (maintenance/backup.py::backup_database) — ez a sorrend
-        garantálja, hogy a mentés a "befagyasztott" állapotot rögzíti,
-        nem eshet bele egy közben érkező írás."""
-        await set_maintenance_mode(self._http, enabled=True)
-        run_state = self._save(run_state, "freezing")
+    async def freeze_writes(self, run_state: RunState) -> RunState:
+        """Írászárolás KÉT szinten: a futó backend memóriájában azonnal, és
+        a Render WRITES_FROZEN környezeti változójában, hogy a zár egy
+        újraindulást/redeployt is túléljen. Utána kivárjuk a már futó
+        írások lezárulását, és csak ezután jöhet a mentés."""
+        await self._provider.set_env_var(self._settings.render_web_service_id, "WRITES_FROZEN", "true")
+        if not await self._admin.set_writes_frozen(True):
+            raise SwapHaltedError("Backend did not confirm the write freeze")
+        await self._sleep(self._settings.write_drain_seconds)
+        return self._advance(run_state, "writes_frozen")
 
-        metadata = backup_database(self._source_dsn, self._source_id)
-        run_state = self._save(run_state, "backing_up", backup_id=metadata.dump_path)
-        return run_state
+    async def backup_source(self, run_state: RunState) -> RunState:
+        """Tartalmi pillanatkép a backendről + pg_dump a forrás példányról."""
+        source_id = run_state.active_instance_id or ""
+        source_dsn = await self._provider.get_connection_string(source_id)
+        snapshot = await self._admin.fetch_snapshot()
+        metadata = await asyncio.to_thread(self._ops.backup, source_dsn, source_id, snapshot, self._settings.backup_dir)
+        return self._advance(run_state, "backed_up", backup_id=metadata.metadata_path)
 
-    # ---- Step 3: provision (or reuse) the target instance -----------------------
+    # ---- 3. practice restore, then retire the old instance (1 free instance limit) --------
+
+    async def rehearse_restore(self, run_state: RunState) -> RunState:
+        metadata = self._ops.load_backup(run_state.backup_id)
+        await self._ops.rehearse(metadata, self._settings.rehearsal_database_url)
+        return self._advance(run_state, "rehearsal_verified")
+
+    async def delete_old_instance(self, run_state: RunState) -> RunState:
+        """Csak az ellenőrzött próbavisszaállítás UTÁN fut; 404 esetén (már
+        törölve egy korábbi, megszakadt futásban) is továbbmegy."""
+        await self._provider.delete_postgres(run_state.active_instance_id or "")
+        return self._advance(run_state, "old_instance_deleted")
+
+    # ---- 4. create the new instance and restore into it -------------------------------------
+
+    def _target_name(self, run_state: RunState) -> str:
+        # A név a futás azonosítójából képződik, így egy megszakadt vagy
+        # bizonytalan kimenetelű létrehozás után név szerint megtalálható.
+        return f"edzesnaplo-db-{run_state.run_id[:8]}"
 
     async def provision_target(self, run_state: RunState) -> RunState:
-        """3. lépés: mivel a Render free tier csak egy aktív Postgres-
-        instance-t enged workspace-enként, előbb törli a régi
-        instance-t (ha van), majd létrehozza az újat a megadott
-        plan/region/verzió paraméterekkel. Az új instance ID-ját
-        elmenti a run_state.target_instance_id mezőbe."""
-        if run_state.active_instance_id:
-            await self._provider.delete_postgres_instance(run_state.active_instance_id)
-            logger.info("Deleted old instance %s (free-tier one-instance limit)", run_state.active_instance_id)
+        s = self._settings
+        name = self._target_name(run_state)
+        instance = await self._provider.find_postgres_by_name(name, s.render_owner_id)
+        if instance is not None:
+            logger.info("Target instance %s (%s) already exists; reusing it", instance["id"], name)
+        else:
+            try:
+                instance = await self._provider.create_postgres(
+                    name=name,
+                    owner_id=s.render_owner_id,
+                    plan=s.target_plan,
+                    region=s.target_region,
+                    version=s.target_pg_version,
+                )
+            except AmbiguousRenderError:
+                instance = await self._provider.find_postgres_by_name(name, s.render_owner_id)
+                if instance is None:
+                    raise SwapHaltedError(f"Creating {name} had an unknown outcome and it cannot be found")
+        return self._advance(run_state, "target_provisioned", target_instance_id=instance["id"])
 
-        new_instance = await self._provider.create_postgres_instance(
-            name=f"edzesnaplo-db-{datetime.now(timezone.utc):%Y%m%d%H%M%S}",
-            plan=DEFAULT_PLAN,
-            region=DEFAULT_REGION,
-            postgres_version=DEFAULT_PG_VERSION,
-            owner_id=RENDER_OWNER_ID,
-        )
-        run_state = self._save(run_state, "provisioning", target_instance_id=new_instance["id"])
-        return run_state
+    async def restore_target(self, run_state: RunState) -> RunState:
+        metadata = self._ops.load_backup(run_state.backup_id)
+        target_id = run_state.target_instance_id or ""
+        await self._provider.wait_until_available(target_id)
+        target_dsn = await self._provider.get_connection_string(target_id)
+        await asyncio.to_thread(self._ops.restore, metadata, target_dsn)
+        return self._advance(run_state, "restored")
 
-    # ---- Step 4: create + restore ------------------------------------------------
+    # ---- 5. repoint the backend, verify, record, release ------------------------------------
 
-    async def create_and_restore(self, run_state: RunState, backup: BackupMetadata | None) -> RunState:
-        """4. lépés: megvárja (async pollozással), amíg az új instance
-        használhatóvá válik, majd a korábban készült mentést
-        visszaállítja bele (maintenance/backup.py::restore_database).
-        Az `ensure_backup_available` hívás garantálja, hogy csak
-        VALÓS, ellenőrzött mentésből állítunk vissza — sosem folytatja
-        a folyamatot, ha a `backup` paraméter None vagy a fájl hiányzik."""
-        verified_backup = ensure_backup_available(backup)  # raises NoBackupAvailableError if missing
+    async def repoint_backend(self, run_state: RunState) -> RunState:
+        """Csak a DATABASE_URL változik (a többi beállítás marad); a
+        WRITES_FROZEN=true miatt az újraindult backend zárolt írással indul."""
+        service_id = self._settings.render_web_service_id
+        target_dsn = await self._provider.get_connection_string(run_state.target_instance_id or "")
+        await self._provider.set_env_var(service_id, "DATABASE_URL", target_dsn)
+        deploy_id = await self._provider.trigger_deploy(service_id)
+        await self._provider.wait_until_deploy_live(service_id, deploy_id)
+        return self._advance(run_state, "repointed")
 
-        instance = await self._provider.wait_until_available(run_state.target_instance_id)
-        restore_database(verified_backup, instance["connectionInfo"]["externalConnectionString"])
-        run_state = self._save(run_state, "restoring")
-        return run_state
-
-    # ---- Step 5: repoint backend + verify ----------------------------------------
-
-    async def repoint_and_verify(self, run_state: RunState, new_dsn: str) -> RunState:
-        """5. lépés: átírja a backend Render service DATABASE_URL
-        környezeti változóját az ÚJ adatbázisra, újra-deployolja a
-        szolgáltatást, és megvárja, amíg a deploy éles lesz. Ezután
-        KÉT külön ellenőrzést végez: egy olvasási próbát
-        (verify_restored_content — valódi adatot kér le, nem csak
-        health-check) és egy írási próbát (verify_writable). Csak ha
-        MINDKETTŐ sikeres, jelöli a futást "completed"-nek, és csak
-        ekkor oldja fel az írászárolást — így a normál felhasználói
-        írások a teljes ellenőrzés alatt is blokkolva maradnak."""
-        await self._provider.update_service_env_var(RENDER_WEB_SERVICE_ID, "DATABASE_URL", new_dsn)
-        deploy = await self._provider.trigger_deploy(RENDER_WEB_SERVICE_ID)
-        await self._provider.wait_until_deploy_live(RENDER_WEB_SERVICE_ID, deploy["id"])
-
-        if not await verify_restored_content(self._http):
-            raise SwapHaltedError("Post-swap read check did not return expected content")
-        if not await verify_writable(self._http):
+    async def verify_cutover(self, run_state: RunState) -> RunState:
+        """A backend olvasó végpontjai a mentéskori tartalmat adják-e vissza,
+        és írható-e az új adatbázis. Siker esetén az új aktív példányt és a
+        teljesített kérést TARTÓSAN rögzítjük, még az írások feloldása előtt."""
+        metadata = self._ops.load_backup(run_state.backup_id)
+        differences = compare_snapshots(metadata.snapshot, await self._admin.fetch_snapshot())
+        if differences:
+            raise SwapHaltedError("Restored content differs: " + "; ".join(differences))
+        if not await self._admin.verify_writable():
             raise SwapHaltedError("Post-swap write check failed")
-
-        run_state = self._save(
+        return self._advance(
             run_state,
-            "completed",
+            "verified",
             active_instance_id=run_state.target_instance_id,
             target_instance_id=None,
+            fulfilled_trigger=run_state.trigger_key,
         )
 
-        await set_maintenance_mode(self._http, enabled=False)
-        return run_state
+    async def release_writes(self, run_state: RunState) -> RunState:
+        await self._provider.set_env_var(self._settings.render_web_service_id, "WRITES_FROZEN", "false")
+        if await self._admin.set_writes_frozen(False):
+            raise SwapHaltedError("Backend did not confirm releasing the write freeze")
+        return self._advance(run_state, "completed", error=None)
 
-    # ---- Resume-after-interruption reconciliation --------------------------------
+    # ---- resume-after-interruption reconciliation --------------------------------------------
 
     async def reconcile(self, run_state: RunState) -> RunState:
-        """On restart with an in-progress run, verify provider state before acting
-        instead of blindly retrying (which could create a duplicate instance).
-
-        Ha a program egy megszakadt futással indul újra (a fázis nem
-        "completed"/"halted"), ez a metódus MEGKÉRDEZI a Rendert, hogy
-        a célinstance ténylegesen létezik-e és elérhető-e — csak ez
-        alapján dönt, sosem tippel. Ha az instance már elérhető, a
-        futás onnan folytatódik, ahol tartott (nem hoz létre egy
-        felesleges második instance-t); ha nem sikerül lekérdezni az
-        állapotot, biztonságosan leáll ("halted"), és kézi
-        beavatkozást kér."""
-        if run_state.phase in ("provisioning", "restoring", "repointing") and run_state.target_instance_id:
+        """Folytatás előtt egyeztet a tényleges állapottal, sosem tippel:
+        a rögzített mentésnek épnek kell lennie, a rögzített célpéldánynak
+        léteznie kell a szolgáltatónál. Ha ez nem igazolható, leáll."""
+        if run_state.backup_id and run_state.phase not in ("verified", "completed"):
+            self._ops.load_backup(run_state.backup_id)  # NoBackupAvailableError -> halt
+        if run_state.target_instance_id:
             try:
-                instance = await self._provider.get_postgres_instance(run_state.target_instance_id)
-            except Exception:
-                logger.warning("Could not reconcile target instance %s; halting", run_state.target_instance_id)
-                return self._save(run_state, "halted", error="Could not verify target instance state on resume")
-
-            if instance.get("status") == "available":
-                logger.info("Target instance %s already exists and is available; resuming", instance["id"])
-                return run_state  # caller resumes from the current phase without re-provisioning
-
+                await self._provider.get_postgres(run_state.target_instance_id)
+            except RenderNotFoundError:
+                return self.halt(run_state, f"Recorded target instance {run_state.target_instance_id} no longer exists")
+            except (RenderApiError, httpx.HTTPError) as exc:
+                return self.halt(run_state, f"Could not verify target instance state on resume: {exc}")
+        logger.info("Reconciled interrupted run %s at phase '%s'", run_state.run_id, run_state.phase)
         return run_state

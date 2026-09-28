@@ -4,20 +4,21 @@ Real async operations (httpx.AsyncClient) as required by the assignment's
 Section 6.1 - a synchronous requests call or a fake asyncio.sleep() would
 not satisfy that requirement.
 
-Ez a fájl az egyetlen hely, ami ténylegesen a Render felhő API-jával
-beszél (HTTP-n keresztül, aszinkron módon). A maintenance/decision.py
-és a maintenance/db_swap_controller.py ezen az osztályon keresztül éri
-el a Rendert — sosem közvetlenül httpx-hívásokkal szórva a kódban.
+Ez az egyetlen hely, ami a Render felhő API-jával beszél. Minden hívás
+a `_request` metóduson megy át, ami a HTTP-státuszt kivételtípussá
+alakítja, és csak az átmeneti hibákat próbálja újra, korlátozottan.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
 
 import httpx
 
-from maintenance.config import RENDER_API_BASE_URL, RENDER_API_KEY
+from maintenance.config import RENDER_API_BASE_URL
+from maintenance.retry import Sleep, with_retries
 
 logger = logging.getLogger(__name__)
 
@@ -27,154 +28,186 @@ class RenderApiError(RuntimeError):
 
 
 class TransientRenderError(RenderApiError):
-    """A retryable failure: network error, timeout, or 5xx response.
-
-    Ezekre a hívó (db_swap_controller) korlátozott számú újrapróbálkozást
-    végezhet — de sosem korlátlanul (Section 6.4: "bounded retries")."""
+    """A retryable failure: network error, timeout, 5xx or 429 rate limit."""
 
 
 class PermissionOrQuotaError(RenderApiError):
-    """A non-retryable failure: 401/403/429 - never auto-escalate billing.
-
-    Jogosultsági/kvóta-hiba esetén a program SOSEM léphet automatikusan
-    fizetős csomagra vagy próbálkozhat végtelenül — ilyenkor a helyes
-    válasz a biztonságos leállás és a hiba naplózása."""
+    """A non-retryable 401/402/403 failure - never retried, never escalates billing."""
 
 
-def _headers() -> dict[str, str]:
-    """A Render API minden hívásához szükséges azonosító fejlécet
-    állítja össze — az API kulcsot a maintenance/config.py adja
-    (végső soron a RENDER_API_KEY környezeti változóból, sosem
-    hardkódolva)."""
-    return {"Authorization": f"Bearer {RENDER_API_KEY}", "Content-Type": "application/json"}
+class RenderNotFoundError(RenderApiError):
+    """404: the requested resource does not exist (any more)."""
+
+
+class AmbiguousRenderError(RenderApiError):
+    """A non-idempotent call failed without a response - its outcome is unknown.
+
+    Ilyenkor tilos vakon újrapróbálni (pl. duplikált példány jönne
+    létre); a hívónak a szolgáltatónál kell egyeztetnie az állapotot."""
 
 
 def _raise_for_status(response: httpx.Response) -> None:
-    """A nyers HTTP státuszkódot a fenti kivétel-típusok egyikévé
-    alakítja, hogy a hívó kód (retry-logika) tudja megkülönböztetni az
-    "érdemes újrapróbálni" és a "sosem próbáld újra" eseteket."""
-    if response.status_code in (401, 403, 429):
-        raise PermissionOrQuotaError(f"{response.status_code}: {response.text}")
-    if response.status_code >= 500:
-        raise TransientRenderError(f"{response.status_code}: {response.text}")
-    response.raise_for_status()
+    """A HTTP-státuszkódot a fenti kivételtípusok egyikévé alakítja."""
+    code = response.status_code
+    if code < 400:
+        return
+    message = f"{response.request.method} {response.request.url.path} -> {code}: {response.text[:300]}"
+    if code in (401, 402, 403):
+        raise PermissionOrQuotaError(message)
+    if code == 404:
+        raise RenderNotFoundError(message)
+    if code == 429 or code >= 500:
+        raise TransientRenderError(message)
+    raise RenderApiError(message)
 
 
 class RenderClient:
-    """Thin async wrapper around the subset of the Render API the swap needs."""
+    """Async wrapper around the subset of the Render API the swap needs."""
 
-    def __init__(self, client: httpx.AsyncClient | None = None):
-        # Ha a hívó ad át saját httpx.AsyncClient-et (pl. teszteléshez,
-        # mock szerverrel), azt használjuk; egyébként létrehozunk egy
-        # sajátot, amit majd nekünk is kell lezárnunk (`_owns_client`).
-        self._client = client or httpx.AsyncClient(base_url=RENDER_API_BASE_URL, headers=_headers())
-        self._owns_client = client is None
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        base_url: str = RENDER_API_BASE_URL,
+        timeout_seconds: float = 30.0,
+        attempts: int = 4,
+        base_delay_seconds: float = 2.0,
+        transport: httpx.AsyncBaseTransport | None = None,
+        sleep: Sleep = asyncio.sleep,
+    ):
+        # A kliens mindig a saját base_url-jével és API-kulcsával jön
+        # létre — a `transport` csak tesztekben cserélődik le egy
+        # httpx.MockTransport-ra, a valódi hálózat helyett.
+        self._client = httpx.AsyncClient(
+            base_url=base_url,
+            headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
+            timeout=timeout_seconds,
+            transport=transport,
+        )
+        self._attempts = attempts
+        self._base_delay = base_delay_seconds
+        self._sleep = sleep
 
-    async def aclose(self) -> None:
-        if self._owns_client:
-            await self._client.aclose()
+    async def __aenter__(self) -> RenderClient:
+        return self
 
-    async def get_postgres_instance(self, instance_id: str) -> dict:
-        """Lekérdezi egy adott Render Postgres-instance jelenlegi
-        állapotát (pl. fut-e, mikor jár le) — ezt hívja a maintenance
-        ütemezett ellenőrzése (Section 6.1)."""
-        resp = await self._client.get(f"/postgres/{instance_id}")
-        _raise_for_status(resp)
-        return resp.json()
+    async def __aexit__(self, *_exc: object) -> None:
+        await self._client.aclose()
 
-    async def create_postgres_instance(
-        self, name: str, plan: str, region: str, postgres_version: str, owner_id: str
-    ) -> dict:
-        """Új Postgres-instance létrehozása a Render API-n keresztül —
-        a csere 3. lépése (provisioning). A paraméterek (plan/region/
-        version) explicit meg vannak adva, nem "alapértelmezésre bízva"
-        (Section 6.3 elvárása)."""
-        payload = {
-            "name": name,
-            "plan": plan,
-            "region": region,
-            "version": postgres_version,
-            "ownerId": owner_id,
-        }
-        resp = await self._client.post("/postgres", json=payload)
-        _raise_for_status(resp)
-        return resp.json()
+    async def _request(self, method: str, path: str, *, idempotent: bool = True, **kwargs: Any) -> httpx.Response:
+        """Egy API-hívás korlátozott újrapróbálkozással.
 
-    async def delete_postgres_instance(self, instance_id: str) -> None:
-        """A régi instance törlése — csak akkor hívjuk, ha a Render
-        fiók csak egy aktív instance-t enged (free tier), és a csere
-        ellenőrzötten sikeres volt."""
-        resp = await self._client.delete(f"/postgres/{instance_id}")
-        _raise_for_status(resp)
+        Nem idempotens hívásnál (pl. példány létrehozása) a válasz nélküli
+        hálózati hiba AmbiguousRenderError lesz, és nem próbáljuk újra."""
+
+        async def attempt() -> httpx.Response:
+            try:
+                response = await self._client.request(method, path, **kwargs)
+            except httpx.TransportError as exc:
+                if not idempotent:
+                    raise AmbiguousRenderError(f"{method} {path}: no response ({exc})") from exc
+                raise TransientRenderError(f"{method} {path}: {exc}") from exc
+            if not idempotent and response.status_code >= 500:
+                # 5xx után nem tudni, létrejött-e az erőforrás; a 429 viszont
+                # biztosan nem dolgozta fel a kérést, azt újrapróbálhatjuk.
+                raise AmbiguousRenderError(f"{method} {path} -> {response.status_code}")
+            _raise_for_status(response)
+            return response
+
+        return await with_retries(
+            attempt,
+            retry_on=(TransientRenderError,),
+            attempts=self._attempts,
+            base_delay_seconds=self._base_delay,
+            description=f"Render {method} {path}",
+            sleep=self._sleep,
+        )
+
+    # ---- Postgres instances ----------------------------------------------------
+
+    async def get_postgres(self, instance_id: str) -> dict[str, Any]:
+        """Egy példány állapota (status, expiresAt, owner stb.)."""
+        return (await self._request("GET", f"/postgres/{instance_id}")).json()
+
+    async def get_connection_string(self, instance_id: str) -> str:
+        """A kapcsolati adatokat a Render külön végponton adja; a külső
+        (internetről elérhető) connection stringet használjuk, mert a
+        vezérlőprogram helyben fut, nem a Render hálózatán belül."""
+        info = (await self._request("GET", f"/postgres/{instance_id}/connection-info")).json()
+        return info["externalConnectionString"]
+
+    async def find_postgres_by_name(self, name: str, owner_id: str) -> dict[str, Any] | None:
+        """Név szerinti keresés — ezzel egyeztetünk egy megszakadt vagy
+        bizonytalan kimenetelű létrehozás után, mielőtt újat hoznánk létre."""
+        response = await self._request("GET", "/postgres", params={"name": name, "ownerId": owner_id})
+        for item in response.json():
+            if item["postgres"]["name"] == name:
+                return item["postgres"]
+        return None
+
+    async def create_postgres(
+        self, *, name: str, owner_id: str, plan: str, region: str, version: str
+    ) -> dict[str, Any]:
+        """Új példány, explicit plan/region/verzió paraméterekkel."""
+        payload = {"name": name, "ownerId": owner_id, "plan": plan, "region": region, "version": version}
+        return (await self._request("POST", "/postgres", idempotent=False, json=payload)).json()
+
+    async def delete_postgres(self, instance_id: str) -> None:
+        """Példány törlése. Ha már nem létezik (pl. egy megszakadt futás
+        már törölte), az nem hiba — a törlés így megismételhető."""
+        try:
+            await self._request("DELETE", f"/postgres/{instance_id}")
+        except RenderNotFoundError:
+            logger.info("Instance %s was already deleted", instance_id)
 
     async def wait_until_available(
-        self, instance_id: str, timeout_seconds: float = 300, poll_interval_seconds: float = 5
-    ) -> dict:
-        """VALÓDI aszinkron várakozás: `await asyncio.sleep(...)` a
-        pollozási ciklusok között, miközben más async feladatok is
-        futhatnának eközben — ez teljesíti a Section 6.1 "valódi async"
-        követelményét (nem egy szimulált, mindent blokkoló sleep).
-        Időtúllépéskor (timeout_seconds után) feladja és hibát dob,
-        sosem vár a végtelenségig."""
-        elapsed = 0.0
-        while elapsed < timeout_seconds:
-            instance = await self.get_postgres_instance(instance_id)
+        self, instance_id: str, timeout_seconds: float = 600, poll_interval_seconds: float = 10
+    ) -> dict[str, Any]:
+        """Aszinkron pollozás, amíg a példány "available" lesz, időkorláttal."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+        while True:
+            instance = await self.get_postgres(instance_id)
             if instance.get("status") == "available":
                 return instance
-            await asyncio.sleep(poll_interval_seconds)
-            elapsed += poll_interval_seconds
-        raise TimeoutError(f"Postgres instance {instance_id} did not become available in time")
+            if loop.time() >= deadline:
+                raise TimeoutError(f"Postgres instance {instance_id} not available after {timeout_seconds}s")
+            await self._sleep(poll_interval_seconds)
 
-    async def update_service_env_var(self, service_id: str, key: str, value: str) -> None:
-        """A backend Render web service egy környezeti változóját (pl.
-        DATABASE_URL) frissíti — ez a csere 5. lépése (repointing).
-        Előbb lekéri az ÖSSZES jelenlegi env-változót, hogy a frissítés
-        ne törölje ki a többit, csak a keresett kulcsot cserélje/adja
-        hozzá."""
-        env_vars_resp = await self._client.get(f"/services/{service_id}/env-vars")
-        _raise_for_status(env_vars_resp)
-        current = env_vars_resp.json()
+    # ---- Web service ---------------------------------------------------------------
 
-        updated = [{"key": item["envVar"]["key"], "value": item["envVar"]["value"]} for item in current]
-        found = False
-        for item in updated:
-            if item["key"] == key:
-                item["value"] = value
-                found = True
-        if not found:
-            updated.append({"key": key, "value": value})
+    async def get_service(self, service_id: str) -> dict[str, Any]:
+        return (await self._request("GET", f"/services/{service_id}")).json()
 
-        resp = await self._client.put(f"/services/{service_id}/env-vars", json=updated)
-        _raise_for_status(resp)
+    async def set_env_var(self, service_id: str, key: str, value: str) -> None:
+        """Egyetlen környezeti változó beállítása; a többi érintetlen marad.
+        Magában nem indít deployt — az a következő újraindításkor lép életbe."""
+        await self._request("PUT", f"/services/{service_id}/env-vars/{key}", json={"value": value})
 
-    async def trigger_deploy(self, service_id: str) -> dict:
-        """Új deploy-t indít a backend service-en, hogy az imént
-        frissített DATABASE_URL ténylegesen érvénybe lépjen a futó
-        alkalmazásban."""
-        resp = await self._client.post(f"/services/{service_id}/deploys", json={})
-        _raise_for_status(resp)
-        return resp.json()
+    async def trigger_deploy(self, service_id: str) -> str:
+        """Deploy indítása; a deploy azonosítóját adja vissza.
+
+        201-nél a válasz tartalmazza a deployt; 202-nél (sorba állítva)
+        nincs törzs, ilyenkor a legfrissebb deployt kérdezzük le."""
+        response = await self._request("POST", f"/services/{service_id}/deploys", idempotent=False, json={})
+        if response.status_code == 201:
+            return response.json()["id"]
+        latest = await self._request("GET", f"/services/{service_id}/deploys", params={"limit": 1})
+        return latest.json()[0]["deploy"]["id"]
 
     async def wait_until_deploy_live(
-        self,
-        service_id: str,
-        deploy_id: str,
-        timeout_seconds: float = 600,
-        poll_interval_seconds: float = 10,
-    ) -> dict:
-        """Kivárja (aszinkron pollozással), amíg a deploy "live"
-        állapotba kerül. Ha a deploy kifejezetten hibás állapotba
-        kerül (build_failed/update_failed/canceled), azonnal hibát
-        dob — nem vár feleslegesen tovább egy már elbukott deployra."""
-        elapsed = 0.0
-        while elapsed < timeout_seconds:
-            resp = await self._client.get(f"/services/{service_id}/deploys/{deploy_id}")
-            _raise_for_status(resp)
-            deploy = resp.json()
-            if deploy.get("status") == "live":
-                return deploy
-            if deploy.get("status") in ("build_failed", "update_failed", "canceled"):
-                raise RenderApiError(f"Deploy {deploy_id} failed with status {deploy.get('status')}")
-            await asyncio.sleep(poll_interval_seconds)
-            elapsed += poll_interval_seconds
-        raise TimeoutError(f"Deploy {deploy_id} did not go live in time")
+        self, service_id: str, deploy_id: str, timeout_seconds: float = 900, poll_interval_seconds: float = 15
+    ) -> None:
+        """Kivárja, amíg a deploy "live"; hibás végállapotnál azonnal hibát dob."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+        while True:
+            deploy = (await self._request("GET", f"/services/{service_id}/deploys/{deploy_id}")).json()
+            status = deploy.get("status")
+            if status == "live":
+                return
+            if status in ("build_failed", "update_failed", "pre_deploy_failed", "canceled", "deactivated"):
+                raise RenderApiError(f"Deploy {deploy_id} ended with status {status}")
+            if loop.time() >= deadline:
+                raise TimeoutError(f"Deploy {deploy_id} not live after {timeout_seconds}s")
+            await self._sleep(poll_interval_seconds)

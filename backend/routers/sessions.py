@@ -10,11 +10,12 @@ from __future__ import annotations
 
 from datetime import date
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from backend.db import get_db
 from backend.maintenance_mode import require_writes_enabled
+from backend.models import Exercise
 from backend.schemas import ProgressionPoint, ProgressionRead, WorkoutSessionCreate, WorkoutSessionRead
 from backend.services.progression_analyzer import ProgressionAnalyzer
 from backend.services.workout_service import UnknownExerciseError, create_workout_session_with_sets
@@ -64,7 +65,11 @@ def get_session_detail(session_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/exercises/{exercise_id}/progression", response_model=ProgressionRead)
-def get_progression(exercise_id: int, lookback_weeks: int = 8, db: Session = Depends(get_db)):
+def get_progression(
+    exercise_id: int,
+    lookback_weeks: int = Query(default=8, ge=1, le=52),
+    db: Session = Depends(get_db),
+):
     """GET /exercises/{id}/progression: a témaspecifikus döntési szabály
     (fejlődés/stagnálás/romlás) elérési útja HTTP-n keresztül.
 
@@ -75,7 +80,10 @@ def get_progression(exercise_id: int, lookback_weeks: int = 8, db: Session = Dep
     és a kapott ProgressionResult mezőit átcsomagolja a válasz sémába
     (ProgressionRead) — ezt kapja meg végül JSON-ként a Streamlit
     "Progression" oldala (frontend/pages/2_Progression.py) a grafikonhoz.
+    Nem létező gyakorlatra 404, 1–52 héten kívüli ablakra 422 a válasz.
     """
+    if db.get(Exercise, exercise_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Exercise {exercise_id} not found")
     analyzer = ProgressionAnalyzer(db)
     result = analyzer.analyze(exercise_id, lookback_weeks=lookback_weeks)
     return ProgressionRead(

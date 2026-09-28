@@ -22,3 +22,7 @@ load_dotenv()
 DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./dev.db")
 MAINTENANCE_TOKEN: str = os.getenv("MAINTENANCE_TOKEN", "dev-maintenance-token")
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
+# DB-csere közben a maintenance program a Render környezeti változóban
+# is bekapcsolja az írászárat, így egy újraindult/újra deployolt backend
+# is zárolt írással indul (Section 6.3/2).
+WRITES_FROZEN_AT_STARTUP: bool = os.getenv("WRITES_FROZEN", "false").strip().lower() in ("1", "true", "yes")

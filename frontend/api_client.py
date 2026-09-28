@@ -33,6 +33,25 @@ def _post(path: str, json: dict[str, Any]) -> httpx.Response:
     return httpx.post(f"{BACKEND_URL}{path}", json=json, timeout=_TIMEOUT)
 
 
+def error_message(exc: httpx.HTTPError) -> str:
+    """Felhasználónak szóló hibaüzenet egy sikertelen hívásból.
+
+    A backend a hiba okát {"detail": ...} JSON-ban adja; ha a válasz nem
+    JSON (pl. az ébredő Render egy HTML hibaoldalt küld), vagy választ
+    sem kaptunk (hálózati hiba, időtúllépés), általános üzenetet adunk."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        try:
+            detail = exc.response.json().get("detail")
+        except ValueError:
+            detail = None
+        if isinstance(detail, str):
+            return detail
+        if exc.response.status_code == 422:
+            return "Érvénytelen bemenet."
+        return f"A szerver hibát jelzett ({exc.response.status_code}). Próbáld újra később."
+    return "A backend nem érhető el (lehet, hogy éppen indul). Próbáld újra fél perc múlva."
+
+
 def list_exercises(category: str | None = None) -> list[dict[str, Any]]:
     """GET /exercises hívása. `raise_for_status()` HTTP-hibakódnál
     (4xx/5xx) kivételt dob — ezt az oldalak (frontend/pages/*.py)

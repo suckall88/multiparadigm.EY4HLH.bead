@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from fastapi import HTTPException, status
 
+from backend.config import WRITES_FROZEN_AT_STARTUP
+
 
 class MaintenanceModeState:
     """Egyszerű, folyamaton belüli (nem adatbázisban tárolt) állapot:
@@ -17,8 +19,8 @@ class MaintenanceModeState:
     a teljes backend-folyamat alatt, ezt osztja meg minden kérés.
     """
 
-    def __init__(self) -> None:
-        self._writes_frozen = False
+    def __init__(self, frozen: bool = False) -> None:
+        self._writes_frozen = frozen
 
     @property
     def writes_frozen(self) -> bool:
@@ -38,7 +40,9 @@ class MaintenanceModeState:
 
 # Modul-szintű, egyetlen (singleton) példány — minden router ugyanezt
 # az objektumot importálja, így mindenki ugyanazt az állapotot látja.
-maintenance_mode_state = MaintenanceModeState()
+# Kezdőértéke a WRITES_FROZEN környezeti változóból jön, hogy a zár egy
+# csere közbeni újraindulást/redeployt is túléljen.
+maintenance_mode_state = MaintenanceModeState(frozen=WRITES_FROZEN_AT_STARTUP)
 
 
 def require_writes_enabled() -> None:

@@ -8,15 +8,23 @@ infrastruktúra" (Section 4 elvárása: közös pytest tesztkészlet).
 
 from __future__ import annotations
 
-import pytest
-from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
+import os
 
-from backend.db import Base, get_db
-from backend.main import app
-from backend.maintenance_mode import maintenance_mode_state
+# A backend modulok importálása ELŐTT: a tesztek (és az app induláskori
+# táblalétrehozása) sose érjék el a fejlesztői dev.db-t vagy a .env-ben
+# megadott adatbázist, és egy lokálisan beállított írászár se szivárogjon be.
+os.environ["DATABASE_URL"] = "sqlite://"
+os.environ["WRITES_FROZEN"] = "false"
+
+import pytest  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+from sqlalchemy import create_engine  # noqa: E402
+from sqlalchemy.orm import sessionmaker  # noqa: E402
+from sqlalchemy.pool import StaticPool  # noqa: E402
+
+from backend.db import Base, get_db  # noqa: E402
+from backend.main import app  # noqa: E402
+from backend.maintenance_mode import maintenance_mode_state  # noqa: E402
 
 
 @pytest.fixture()

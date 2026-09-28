@@ -1,194 +1,158 @@
-"""Procedural top-level maintenance workflow: check -> decide -> backup -> provision -> restore -> repoint.
+"""Procedural top-level maintenance workflow: check -> decide -> run the swap steps.
 
 Procedural paradigm: a single, followable, function-decomposed flow, not a
-class - orchestration only, all real logic lives in the collaborators it
-calls (decision.py, DBSwapController, RenderClient).
+class - orchestration only; the decision is a pure function
+(decision.py) and the swap steps live in DBSwapController.
 
-Ez a modul a maintenance rendszer "karmestere": ő hívja meg sorban az
-összes darabot (döntés, zárolás, mentés, létrehozás, visszaállítás,
-átirányítás), de maga nem tartalmaz üzleti logikát — az mind a hívott
-modulokban van. Ezt hívja meg periodikusan a maintenance/scheduler.py.
+Egy ciklus:
+1) betölti a legutóbbi futást (ebből tudja, melyik az aktív példány),
+2) elvégzi a valódi async állapotellenőrzést és naplózza az eredményt,
+3) ha nincs folyamatban futás: dönt (decide_swap), és csak jogosított
+   (MAINTENANCE_SWAP_ENABLED) esetben indít cserét,
+4) megszakadt futásnál előbb egyeztet (reconcile), majd az utoljára
+   befejezett lépés UTÁNI lépéstől folytatja,
+5) bármilyen hiba esetén biztonságosan leáll ("halted"); egy leállt
+   futás után a program semmit nem csinál, amíg egy ember a
+   `--resume` kapcsolóval jóvá nem hagyja a folytatást.
 """
 
 from __future__ import annotations
 
 import logging
+import uuid
 from datetime import datetime, timezone
 
 import httpx
 
-from maintenance.backend_admin import set_maintenance_mode
-from maintenance.backup import NoBackupAvailableError, latest_backup
-from maintenance.config import MAINTENANCE_AT, RENDER_API_KEY
-from maintenance.db_swap_controller import DBSwapController, SwapHaltedError
+from maintenance.config import MaintenanceSettings
+from maintenance.db_swap_controller import DBSwapController, Step
 from maintenance.decision import decide_swap
-from maintenance.models import CheckResult, RunState
-from maintenance.provider_client import RenderClient, RenderApiError
-from maintenance.state import AnotherRunInProgressError, StateStore
+from maintenance.models import SWAP_PHASES, CheckResult, RunState
+from maintenance.provider_client import RenderApiError, RenderClient
+from maintenance.state import StateStore
 
 logger = logging.getLogger(__name__)
 
 
-async def check_instance_status(client: httpx.AsyncClient, instance_id: str) -> CheckResult:
+async def check_instance_status(provider: RenderClient, instance_id: str) -> CheckResult:
     """A real async status check against the Render API (Section 6.1).
 
-    Ez az EGYETLEN "valódi async" művelet, amit a beadandó Section 6.1
-    kifejezetten megkövetel: `await client.get(...)` egy igazi hálózati
-    hívás a Render API felé (nem szimulált sleep). Sikeres válasz esetén
-    kiolvassa a lejárati dátumot (`expiresAt`); hálózati hiba esetén nem
-    dob kivételt, hanem egy `reachable=False` CheckResult-tal tér vissza
-    — ezt a maintenance/decision.py::decide_swap kapja meg bemenetként.
-    """
+    Hálózati/API hiba esetén nem dob kivételt, hanem `reachable=False`
+    eredményt ad — ezt a decide_swap sosem tekinti csere-indoknak."""
     now = datetime.now(timezone.utc)
+    if not instance_id:
+        return CheckResult(checked_at=now, reachable=False, error="no active instance configured")
     try:
-        resp = await client.get(
-            f"https://api.render.com/v1/postgres/{instance_id}",
-            headers={"Authorization": f"Bearer {RENDER_API_KEY}"},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        expires_at_raw = data.get("expiresAt")
-        expires_at = datetime.fromisoformat(expires_at_raw) if expires_at_raw else None
-        return CheckResult(checked_at=now, reachable=True, expires_at=expires_at)
-    except httpx.HTTPError as exc:
-        logger.warning("Status check failed for instance %s: %s", instance_id, exc)
+        instance = await provider.get_postgres(instance_id)
+    except (RenderApiError, httpx.HTTPError) as exc:
         return CheckResult(checked_at=now, reachable=False, error=str(exc))
+    expires_raw = instance.get("expiresAt")
+    return CheckResult(
+        checked_at=now,
+        reachable=instance.get("status") == "available",
+        status=instance.get("status"),
+        expires_at=datetime.fromisoformat(expires_raw) if expires_raw else None,
+        error=None if instance.get("status") == "available" else f"instance status {instance.get('status')}",
+    )
 
 
-def _parse_maintenance_at() -> datetime | None:
-    """A konfigurált MAINTENANCE_AT környezeti változót (ha van)
-    alakítja igazi datetime objektummá — ezt kapja meg a decide_swap,
-    hogy próbafuttatáshoz felülírhassa a valós lejárat-alapú döntést."""
-    if MAINTENANCE_AT is None:
-        return None
-    return datetime.fromisoformat(MAINTENANCE_AT)
+def _new_run(active_instance_id: str, trigger_key: str | None, previous: RunState | None) -> RunState:
+    now = datetime.now(timezone.utc)
+    return RunState(
+        run_id=str(uuid.uuid4()),
+        phase="started",
+        started_at=now,
+        updated_at=now,
+        active_instance_id=active_instance_id,
+        trigger_key=trigger_key,
+        # Az előzőleg teljesített kérés megmarad, amíg ez a futás be nem fejeződik.
+        fulfilled_trigger=previous.fulfilled_trigger if previous else None,
+    )
+
+
+def _remaining_steps(controller: DBSwapController, phase: str) -> list[tuple[str, Step]]:
+    """Azok a lépések, amelyek a `phase` (utoljára befejezett lépés) után jönnek."""
+    done = SWAP_PHASES.index(phase)
+    return [(name, step) for name, step in controller.steps() if SWAP_PHASES.index(name) > done]
 
 
 async def run_maintenance_cycle(
-    active_instance_id: str,
-    source_dsn: str,
-    state_store: StateStore | None = None,
-) -> RunState:
+    settings: MaintenanceSettings,
+    provider: RenderClient,
+    controller: DBSwapController,
+    state_store: StateStore,
+    now: datetime | None = None,
+) -> RunState | None:
     """One full check-and-maybe-swap cycle. Safe to call on a fixed schedule.
 
-    Ezt a függvényt hívja a maintenance/scheduler.py egy `while True`
-    ciklusban, `CHECK_INTERVAL_SECONDS` másodpercenként. A teljes
-    lépéssor:
-    1) betölti az esetleg megszakadt korábbi futást (state_store.load),
-    2) elvégzi a valódi async állapotellenőrzést (check_instance_status),
-    3) meghozza a döntést (decide_swap) — ha nem kell csere és nincs
-       folyamatban lévő futás, azonnal visszatér ("idle"),
-    4) ha kell csere (vagy folytatni kell egyet), zárolást szerez
-       (hogy csak egy csere fusson egyszerre), rekonstruálja az
-       állapotot (`controller.reconcile`), majd sorban végrehajtja az
-       5 lépést a DBSwapController-en keresztül,
-    5) sikeres befejezéskor elmenti, hogy ez a konkrét lejárati
-       időpont "fulfilled" (ne induljon újra csere ugyanazért),
-    6) bármilyen ismert hiba esetén biztonságosan leáll ("halted"),
-       sosem talál ki adatot vagy próbál automatikusan tovább menni,
-    7) a `finally` ág mindig feloldja a zárolást, függetlenül attól,
-       hogy siker vagy hiba volt-e.
-    """
-    state_store = state_store or StateStore()
-
-    # Ha van korábbi, még be nem fejezett futás, azt folytatjuk —
-    # nem indítunk egy vadonatúj futást a régi helyett.
-    existing = state_store.load()
-    if existing is not None and existing.phase not in ("completed", "halted"):
-        logger.info("Resuming interrupted run %s (phase=%s)", existing.run_id, existing.phase)
-        run_state = existing
-    else:
-        run_state = None
-
-    async with httpx.AsyncClient(timeout=10.0) as http_client:
-        check = await check_instance_status(http_client, active_instance_id)
-        decision = decide_swap(check, run_state, datetime.now(timezone.utc), maintenance_at=_parse_maintenance_at())
-        logger.info("Swap decision: should_swap=%s reason=%s", decision.should_swap, decision.reason)
-
-        # Ha nincs folyamatban lévő futás ÉS a döntés szerint nem kell
-        # csere, nincs több teendő ebben a ciklusban.
-        if not decision.should_swap and run_state is None:
-            idle = RunState(
-                run_id="none",
-                phase="idle",
-                started_at=datetime.now(timezone.utc),
-                updated_at=datetime.now(timezone.utc),
-                active_instance_id=active_instance_id,
-            )
-            return idle
-
-        provider = RenderClient(client=http_client)
-        controller = DBSwapController(
-            provider=provider,
-            state_store=state_store,
-            http_client=http_client,
-            source_dsn=source_dsn,
-            source_id=active_instance_id,
+    A visszatérési érték a futás állapota, vagy None, ha nem kellett cserélni."""
+    last = state_store.load()
+    if last is not None and last.phase == "halted":
+        logger.error(
+            "Previous swap run %s is halted after '%s' (%s); no action until an operator runs --resume",
+            last.run_id,
+            last.halted_from,
+            last.error,
         )
+        return last
 
-        # Zárolás megszerzése: ha már fut egy másik csere (pl. egy
-        # átfedő ütemezett hívás), ez a ciklus egyszerűen kihagyja
-        # magát, nem próbálja meg párhuzamosan is végrehajtani.
-        try:
-            state_store.acquire_lock(run_state.run_id if run_state else "pending")
-        except AnotherRunInProgressError:
-            logger.warning("Another maintenance run is already in progress; skipping this cycle")
-            return run_state or RunState(
-                run_id="skipped",
-                phase="idle",
-                started_at=datetime.now(timezone.utc),
-                updated_at=datetime.now(timezone.utc),
-            )
+    active_id = (last.active_instance_id if last else None) or settings.active_db_instance_id
+    in_progress = last if last is not None and last.phase not in ("completed", "idle") else None
 
-        try:
-            if run_state is None:
-                run_state = controller._new_run_state()
-                run_state.active_instance_id = active_instance_id
+    check = await check_instance_status(provider, active_id)
+    logger.info(
+        "Status check: instance=%s reachable=%s status=%s expires_at=%s error=%s",
+        active_id,
+        check.reachable,
+        check.status,
+        check.expires_at,
+        check.error,
+    )
 
-            # Megszakadt futás esetén előbb egyeztet a valós
-            # szolgáltatói állapottal (lásd DBSwapController.reconcile
-            # docstringjét), mielőtt bármit is újra végrehajtana.
-            run_state = await controller.reconcile(run_state) if run_state.phase != "idle" else run_state
+    if in_progress is not None:
+        logger.info("Resuming interrupted run %s after step '%s'", in_progress.run_id, in_progress.phase)
+        run_state = in_progress
+    else:
+        decision = decide_swap(
+            check,
+            last,
+            now or datetime.now(timezone.utc),
+            maintenance_at=settings.maintenance_at,
+            expiry_warning_days=settings.expiry_warning_days,
+        )
+        logger.info("Swap decision: should_swap=%s reason=%s", decision.should_swap, decision.reason)
+        if not decision.should_swap:
+            return None
+        if not settings.swap_enabled:
+            logger.warning("Swap warranted but MAINTENANCE_SWAP_ENABLED is not set; not touching any resource")
+            return None
+        run_state = _new_run(active_id, decision.trigger_key, last)
+        state_store.save(run_state)
+
+    try:
+        if in_progress is not None:
+            run_state = await controller.reconcile(run_state)
             if run_state.phase == "halted":
                 return run_state
+        for _phase, step in _remaining_steps(controller, run_state.phase):
+            run_state = await step(run_state)
+        logger.info("Swap run %s completed; active instance is now %s", run_state.run_id, run_state.active_instance_id)
+        return run_state
+    except Exception as exc:  # noqa: BLE001 - every failure must end in a durable, safe halt
+        return controller.halt(run_state, f"{type(exc).__name__}: {exc}")
 
-            # Az öt hivatalos csere-lépés, sorban:
-            run_state = controller.check_prerequisites(run_state)  # 1. előfeltételek
-            run_state = await controller.freeze_writes_and_backup(run_state)  # 2. zárolás + mentés
-            backup = latest_backup()
-            run_state = await controller.provision_target(run_state)  # 3. új instance létrehozása
-            run_state = await controller.create_and_restore(run_state, backup)  # 4. visszaállítás
 
-            provisioned = await provider.get_postgres_instance(run_state.target_instance_id)
-            new_dsn = provisioned["connectionInfo"]["externalConnectionString"]
-            run_state = await controller.repoint_and_verify(run_state, new_dsn)  # 5. átirányítás + ellenőrzés
+def resume_halted_run(state_store: StateStore) -> RunState | None:
+    """Operator command: after manual inspection, let the next cycle continue a halted run.
 
-            # Megjegyezzük, hogy EZ a konkrét lejárati időpont már
-            # "el van intézve" — a legközelebbi ellenőrzés ugyanerre az
-            # expires_at-ra már nem fog újra cserét indítani
-            # (lásd maintenance/decision.py 2. szabálya).
-            if check.expires_at is not None:
-                run_state.fulfilled_expiry_at = check.expires_at.isoformat()
-                state_store.save(run_state)
-
-            return run_state
-
-        except (NoBackupAvailableError, SwapHaltedError, RenderApiError) as exc:
-            # Bármely ismert, "biztonságosan kezelendő" hiba esetén nem
-            # próbálunk automatikusan javítani vagy visszagörgetni —
-            # csak naplózzuk, elmentjük a "halted" állapotot a hibával
-            # együtt, és egy embernek kell utánanéznie.
-            logger.error("Maintenance swap halted: %s", exc)
-            run_state = run_state or controller._new_run_state()
-            run_state.phase = "halted"
-            run_state.error = str(exc)
-            run_state.updated_at = datetime.now(timezone.utc)
-            state_store.save(run_state)
-            # Safely leave writes frozen or unfrozen depending on how far we got;
-            # never auto-rollback or fabricate data - a human must follow up.
-            return run_state
-        finally:
-            # Ez a sor MINDIG lefut (siker, kezelt hiba, vagy akár
-            # nem várt kivétel esetén is), így a zárolás sosem ragad
-            # be véglegesen egy hibás futás után.
-            state_store.release_lock()
+    A futás visszakerül az utoljára befejezett lépésre (`halted_from`);
+    a következő ciklus előbb egyeztet (reconcile), és onnan folytat."""
+    run_state = state_store.load()
+    if run_state is None or run_state.phase != "halted":
+        return None
+    run_state.phase = run_state.halted_from or "started"  # type: ignore[assignment]
+    run_state.error = None
+    run_state.updated_at = datetime.now(timezone.utc)
+    run_state.log.append(f"{run_state.updated_at.isoformat()} resumed by operator")
+    state_store.save(run_state)
+    return run_state

@@ -9,11 +9,23 @@ from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from backend.config import DATABASE_URL
 
-# SQLite-nál külön be kell kapcsolni, hogy több szálról/kérésből is
-# lehessen ugyanazt a kapcsolatot használni (FastAPI request-enként
-# más szálon futhat). Más adatbázisnál (pl. Postgres) erre nincs
-# szükség, ezért ott üres marad az extra paraméter.
-_connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+
+def connect_args_for(url: str) -> dict[str, object]:
+    """Adatbázis-specifikus kapcsolati paraméterek.
+
+    SQLite: több szálról is használható legyen a kapcsolat (a FastAPI a
+    kéréseket más-más szálon futtathatja). Postgres: a munkamenet
+    időzónája mindig UTC, így az időbélyegek ugyanúgy szerializálódnak
+    bármelyik szerveren — ezen múlik, hogy a DB-csere előtti és utáni
+    tartalmi pillanatkép összevethető legyen."""
+    if url.startswith("sqlite"):
+        return {"check_same_thread": False}
+    if url.startswith("postgres"):
+        return {"options": "-c timezone=UTC"}
+    return {}
+
+
+_connect_args = connect_args_for(DATABASE_URL)
 
 # Az "engine" a tényleges adatbázis-kapcsolatot (connection pool-t) fogja
 # össze. A DATABASE_URL-t a backend/config.py adja (ami meg a .env-ből

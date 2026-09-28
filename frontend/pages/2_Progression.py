@@ -12,7 +12,7 @@ import httpx
 import pandas as pd
 import streamlit as st
 
-from api_client import get_progression, list_exercises
+from api_client import error_message, get_progression, list_exercises
 
 st.set_page_config(page_title="Progresszió", page_icon="📈")
 st.title("📈 Progresszió")
@@ -20,7 +20,7 @@ st.title("📈 Progresszió")
 try:
     exercises = list_exercises()
 except httpx.HTTPError as exc:
-    st.error(f"Nem sikerült lekérni a gyakorlatokat: {exc}")
+    st.error(f"Nem sikerült lekérni a gyakorlatokat: {error_message(exc)}")
     exercises = []
 
 if not exercises:
@@ -40,7 +40,7 @@ else:
         # keresztül számolja ki a választ.
         progression = get_progression(exercise_id, lookback_weeks=lookback_weeks)
     except httpx.HTTPError as exc:
-        st.error(f"Nem sikerült lekérni a progressziót: {exc}")
+        st.error(f"Nem sikerült lekérni a progressziót: {error_message(exc)}")
         progression = None
 
     if progression is not None:
@@ -50,7 +50,7 @@ else:
         status = progression["status"]
         status_labels = {
             "improving": ("🟢 Fejlődő", "success"),
-            "plateau": ("🟡 Platóznak", "warning"),
+            "plateau": ("🟡 Stagnálás", "warning"),
             "declining": ("🔴 Visszaesés", "error"),
             "insufficient_data": ("⚪ Kevés adat", "info"),
         }

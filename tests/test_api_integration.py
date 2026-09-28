@@ -85,6 +85,23 @@ def test_missing_session_returns_404(client):
     assert "not found" in resp.json()["detail"]
 
 
+def test_invalid_requests_get_meaningful_status_codes(client):
+    """Hibás bemenet és hiányzó adat: érthető státuszkód, nem 500."""
+    assert client.post("/exercises", json={"name": "Evezés", "category": "pull"}).status_code == 201
+    duplicate = client.post("/exercises", json={"name": "Evezés", "category": "pull"})
+    assert duplicate.status_code == 409
+    assert "already exists" in duplicate.json()["detail"]
+
+    assert client.get("/exercises/999/progression").status_code == 404
+    assert client.get("/exercises/1/progression", params={"lookback_weeks": 0}).status_code == 422
+
+    unknown = client.post(
+        "/sessions",
+        json={"session_date": "2026-09-01", "sets": [{"exercise_id": 999, "weight_kg": 50, "reps": 5, "set_number": 1}]},
+    )
+    assert unknown.status_code == 400
+
+
 def test_writes_rejected_while_maintenance_mode_frozen(client):
     """Ez ellenőrzi a Section 6.3 "írászárolás" mechanizmusát: a belső
     (tokenes) végponton zárolt írások esetén a NYILVÁNOS POST

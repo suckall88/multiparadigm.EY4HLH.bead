@@ -33,8 +33,9 @@ def create_exercise(
     `require_writes_enabled` egy védelmi "dependency": ha épp DB-csere
     miatt zárolva vannak az írások (backend/maintenance_mode.py), ez a
     function-törzs le sem fut, egyből 503-at kap a kliens.
-    Az `IntegrityError` (pl. duplikált név, mivel `name` unique) esetén
-    416-os helyett 400-as, érthető hibaüzenetet adunk vissza.
+    Duplikált név esetén (a `name` oszlop egyedi) az adatbázis
+    `IntegrityError`-t dob; ezt 409 Conflict válasszá alakítjuk,
+    érthető hibaüzenettel, a tranzakció visszagörgetése után.
     """
     exercise = Exercise(name=payload.name, category=payload.category)
     db.add(exercise)
@@ -42,7 +43,7 @@ def create_exercise(
         db.commit()
     except IntegrityError:
         db.rollback()
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Exercise '{payload.name}' already exists")
+        raise HTTPException(status.HTTP_409_CONFLICT, f"Exercise '{payload.name}' already exists")
     db.refresh(exercise)
     # A visszaadott Exercise ORM-objektumot a FastAPI a response_model
     # (ExerciseRead) alapján automatikusan JSON-ná alakítja.

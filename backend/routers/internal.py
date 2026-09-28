@@ -20,6 +20,8 @@ from backend.models import Exercise
 
 router = APIRouter(prefix="/internal", tags=["internal"])
 
+WRITE_CHECK_NAME = "__maintenance_write_check__"
+
 
 class MaintenanceModeRequest(BaseModel):
     enabled: bool
@@ -82,7 +84,10 @@ def write_check(
     erre a belső, tokenes végpontra nem).
     """
     _check_token(x_maintenance_token)
-    probe = Exercise(name="__maintenance_write_check__", category="internal")
+    # Egy korábbi, félbeszakadt ellenőrzés maradványát előbb eltávolítjuk,
+    # különben az egyedi név miatt a beszúrás hibára futna.
+    db.query(Exercise).filter(Exercise.name == WRITE_CHECK_NAME).delete()
+    probe = Exercise(name=WRITE_CHECK_NAME, category="internal")
     db.add(probe)
     db.commit()
     db.delete(probe)
