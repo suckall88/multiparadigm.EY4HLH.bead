@@ -74,7 +74,7 @@ def estimate_one_rm(weight_kg: float, reps: int) -> float:
     """
     if weight_kg <= 0:
         raise ValueError("weight_kg must be positive")
-    if not (MIN_REPS <= reps <= MAX_REPS + 1):
+    if not (MIN_REPS <= reps <= MAX_REPS):
         raise ValueError(f"reps must be between {MIN_REPS} and {MAX_REPS}")
     return weight_kg * (1 + reps / 30)
 
