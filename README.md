@@ -191,15 +191,19 @@ A `.github/workflows/ci.yml` minden `push`/`pull_request` eseményen lefuttatja 
 
 ### Dokumentált hibajavítási eset
 
-_TODO: a GitHub-repó újraindítása után ide kerülnek a hibás (piros) és a javított (zöld) CI-futás linkjei, valamint a hozzájuk tartozó commitok._
+Az eset a `bugfix/one-rm-off-by-one` branch-en készült (nem a `main`-en, deployhoz nem kapcsolva):
 
-Tervezett eset (egy `main`-hez nem kötött, deployhoz nem kapcsolt branch-en):
+| Lépés | Commit | CI-futás |
+|---|---|---|
+| Hiba bevezetése | [`7bcf84e`](https://github.com/suckall88/multiparadigm.EY4HLH.bead/commit/7bcf84e82f031dd6b7bc31ee3018237ab8a1ae3b) | [piros – 1 failed, 40 passed](https://github.com/suckall88/multiparadigm.EY4HLH.bead/actions/runs/37490801426) |
+| Javítás | [`2939821`](https://github.com/suckall88/multiparadigm.EY4HLH.bead/commit/2939821e2ab508017eaa99d82402c9f169f94969) | [zöld – 41 passed](https://github.com/suckall88/multiparadigm.EY4HLH.bead/actions/runs/37491200915) |
+| Merge a `main`-be (`--no-ff`) | `67bdf48` | – |
 
 - **Tünet/hiba**: `estimate_one_rm` ismétlésszám-felső-határ ellenőrzése hibásan `MAX_REPS + 1`-re lazul, így `reps=13` érvényesnek tűnik.
-- **Ok**: off-by-one hiba a validációs feltételben.
-- **Észlelés**: a meglévő `test_estimate_one_rm_invalid_reps[100.0-13]` paraméterezett teszteset elbukik, a CI pirosra vált.
+- **Ok**: off-by-one hiba a validációs feltételben (`backend/domain/progression.py`).
+- **Észlelés**: a meglévő `test_estimate_one_rm_invalid_reps[100.0-13]` paraméterezett teszteset elbukik („DID NOT RAISE ValueError”), a CI pirosra vált.
 - **Javítás**: a határ visszaáll `MAX_REPS`-re, a CI zöldre vált.
-- **Ellenőrzés**: a branch csak a zöld futás után kerül `--no-ff` merge-dzsel a `main`-be.
+- **Ellenőrzés**: a branch csak a zöld futás után került `--no-ff` merge-dzsel a `main`-be.
 
 ## Források és bővítések
 
