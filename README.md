@@ -187,7 +187,7 @@ A tesztek nem érnek el élő szolgáltatást, és nem módosítanak felhős er�
 
 ### CI
 
-A `.github/workflows/ci.yml` minden `push`/`pull_request` eseményen lefuttatja ugyanezt a tesztcsomagot (Python 3.12, Ubuntu).
+A `.github/workflows/ci.yml` minden `push`/`pull_request` eseményen lefuttatja ugyanezt a tesztcsomagot (Python 3.12, Ubuntu 24.04).
 
 ### Dokumentált hibajavítási eset
 
